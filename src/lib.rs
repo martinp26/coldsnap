@@ -57,6 +57,7 @@ waiter.wait_for_completed("snap-1234")
 */
 
 mod block_device;
+mod data_map;
 mod download;
 mod upload;
 mod wait;
