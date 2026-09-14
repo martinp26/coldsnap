@@ -130,9 +130,8 @@ async fn run() -> Result<()> {
             );
 
             let progress_bar = build_progress_bar(upload_args.no_progress, "Uploading");
-            let zero_blocks = upload_args
-                .omit_zero_blocks
-                .then_some(UploadZeroBlocks::Omit);
+            let zero_blocks =
+                resolve_zero_blocks(upload_args.omit_zero_blocks, upload_args.detect_holes)?;
 
             debug!("Uploading {}", upload_args.file.display());
             let snapshot_id = uploader
@@ -411,6 +410,24 @@ mod test {
             assert!(tag_from_str(input).is_err());
         }
     }
+
+    #[test]
+    fn resolve_zero_blocks_modes() {
+        // No flags: upload everything.
+        assert!(resolve_zero_blocks(false, false).unwrap().is_none());
+        // --omit-zero-blocks: content-scan omission.
+        assert_eq!(
+            resolve_zero_blocks(true, false).unwrap(),
+            Some(UploadZeroBlocks::Omit)
+        );
+        // --detect-holes: hole-only omission.
+        assert_eq!(
+            resolve_zero_blocks(false, true).unwrap(),
+            Some(UploadZeroBlocks::OmitHoles)
+        );
+        // Both: rejected.
+        assert!(resolve_zero_blocks(true, true).is_err());
+    }
 }
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -449,8 +466,17 @@ struct UploadArgs {
     wait: bool,
 
     #[argh(switch)]
-    /// omit blocks of all zeros when uploading
+    /// omit all-zero blocks via content scan (accelerated by hole detection);
+    /// NOT safe for encrypted-launch snapshots (dropped allocated-zero blocks
+    /// read back as garbage once encrypted); mutually exclusive with
+    /// --detect-holes
     omit_zero_blocks: bool,
+
+    #[argh(switch)]
+    /// omit only never-written filesystem holes via SEEK_HOLE, uploading all
+    /// written data including zero blocks; safe for encrypted-launch snapshots;
+    /// mutually exclusive with --omit-zero-blocks
+    detect_holes: bool,
 
     #[argh(option)]
     /// number of concurrent upload workers (default: 64)
@@ -459,6 +485,26 @@ struct UploadArgs {
     #[argh(option)]
     /// number of independent EBS clients for higher-concurrency uploads (default: 1)
     client_shards: Option<usize>,
+}
+
+/// Resolve the two mutually-exclusive sparse-upload flags into a `ZeroBlocks`
+/// mode. `--omit-zero-blocks` wins nothing over `--detect-holes`; supplying both
+/// is an error.
+fn resolve_zero_blocks(
+    omit_zero_blocks: bool,
+    detect_holes: bool,
+) -> Result<Option<UploadZeroBlocks>> {
+    ensure!(
+        !(omit_zero_blocks && detect_holes),
+        error::OmitZeroAndDetectHolesSnafu
+    );
+    Ok(if omit_zero_blocks {
+        Some(UploadZeroBlocks::Omit)
+    } else if detect_holes {
+        Some(UploadZeroBlocks::OmitHoles)
+    } else {
+        None
+    })
 }
 
 /// Turn a user-specified duration in seconds into a Duration object, for argh parsing.
@@ -532,5 +578,8 @@ mod error {
 
         #[snafu(display("--parent-snapshot-id and --kms-key-id cannot be used together (EBS StartSnapshot rejects Encrypted + ParentSnapshotId)"))]
         ParentAndKms,
+
+        #[snafu(display("--omit-zero-blocks and --detect-holes cannot be used together"))]
+        OmitZeroAndDetectHoles,
     }
 }

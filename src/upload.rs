@@ -6,6 +6,7 @@ Upload Amazon EBS snapshots.
 */
 
 use crate::block_device::get_block_device_size;
+use crate::data_map::DataMap;
 use aws_sdk_ebs::primitives::ByteStream;
 use aws_sdk_ebs::types::{ChecksumAggregationMethod, ChecksumAlgorithm, Tag};
 use aws_sdk_ebs::Client as EbsClient;
@@ -92,7 +93,7 @@ impl UploadStats {
 }
 
 /// Specify how blocks of all zeroes should be handled.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ZeroBlocks {
     /// Include blocks of all zeroes in the snapshot.
     Include,
@@ -100,6 +101,21 @@ pub enum ZeroBlocks {
     /// This is incompatible with encrypted snapshots if the application expects to read zeroes
     /// from those blocks.
     Omit,
+    /// Omit only never-written filesystem holes, detected via `SEEK_DATA`/`SEEK_HOLE`.
+    /// Blocks written with zeroes are still uploaded, so this is safe for encrypted snapshots.
+    OmitHoles,
+}
+
+impl ZeroBlocks {
+    /// Whether blocks lying entirely in a hole are skipped without reading them.
+    fn omits_holes(self) -> bool {
+        matches!(self, ZeroBlocks::Omit | ZeroBlocks::OmitHoles)
+    }
+
+    /// Whether blocks that read back as all zeroes are skipped.
+    fn omits_zero_content(self) -> bool {
+        matches!(self, ZeroBlocks::Omit)
+    }
 }
 
 pub struct SnapshotUploader {
@@ -232,6 +248,49 @@ impl SnapshotUploader {
 
         let zero_blocks = zero_blocks.unwrap_or(ZeroBlocks::Include);
 
+        // Build the hole map once. Block devices and filesystems without hole
+        // support get a full map, so nothing is skipped as a hole.
+        let size = u64::try_from(file_size).with_context(|_| error::ConvertNumberSnafu {
+            what: "file size",
+            number: file_size.to_string(),
+            target: "u64",
+        })?;
+        let data_map = if zero_blocks.omits_holes() {
+            if file_meta.file_type().is_block_device() {
+                debug!(
+                    "source is a block device; SEEK_HOLE hole detection is \
+                     unavailable, uploading all allocated blocks (content-zero \
+                     omission still applies for --omit-zero-blocks)"
+                );
+                DataMap::full(size)
+            } else {
+                let scan_path = PathBuf::from(path);
+                // A scan error is fatal (the workers would fail the same way);
+                // an unsupported filesystem (Ok(None)) falls back to a full map.
+                let scanned =
+                    tokio::task::spawn_blocking(move || DataMap::from_path(&scan_path, size))
+                        .await
+                        .context(error::HoleMapTaskSnafu)?
+                        .context(error::BuildDataMapSnafu { path })?;
+                match scanned {
+                    Some(map) => {
+                        debug!("hole detection: {} data extents", map.extent_count());
+                        map
+                    }
+                    None => {
+                        debug!(
+                            "hole detection unsupported on this filesystem; \
+                             uploading based on block content only"
+                        );
+                        DataMap::full(size)
+                    }
+                }
+            }
+        } else {
+            DataMap::full(size)
+        };
+        let data_map = Arc::new(data_map);
+
         // Create a context for each block that can be moved to another thread.
         let mut block_contexts = Vec::new();
         let mut remaining_data = file_size;
@@ -259,6 +318,7 @@ impl SnapshotUploader {
                 progress_bar: Arc::clone(&progress_bar),
                 ebs_client: self.client_for_block(i).clone(),
                 zero_blocks,
+                data_map: Arc::clone(&data_map),
             });
 
             remaining_data -= i64::from(block_size);
@@ -340,6 +400,12 @@ impl SnapshotUploader {
         }
 
         let changed_blocks_count = changed_blocks_count.load(AtomicOrdering::Relaxed);
+
+        let omitted_blocks = file_blocks.saturating_sub(changed_blocks_count);
+        info!(
+            "Uploaded {changed_blocks_count} of {file_blocks} blocks \
+             ({omitted_blocks} omitted as holes/zeros)"
+        );
 
         // Compute the "linear" hash - the hash of all hashes in block index order.
         let block_digests = Arc::try_unwrap(block_digests)
@@ -435,9 +501,6 @@ impl SnapshotUploader {
     /// Read from the file in context and upload a single block to the snapshot.
     async fn upload_block(&self, context: &BlockContext) -> Result<()> {
         let path: &Path = context.path.as_ref();
-        let mut f = File::open(path)
-            .await
-            .context(error::OpenFileSnafu { path })?;
 
         let block_index_u64: u64 =
             u64::try_from(context.block_index).with_context(|_| error::ConvertNumberSnafu {
@@ -462,6 +525,25 @@ impl SnapshotUploader {
                 target: "u64",
             })?;
 
+        // Skip blocks that lie entirely in a hole without opening the file.
+        if context.zero_blocks.omits_holes() {
+            let data_length =
+                u64::try_from(context.data_length).with_context(|_| error::ConvertNumberSnafu {
+                    what: "data length",
+                    number: context.data_length.to_string(),
+                    target: "u64",
+                })?;
+            if !context.data_map.range_has_data(offset, data_length) {
+                if let Some(ref progress_bar) = *context.progress_bar {
+                    progress_bar.inc(1);
+                }
+                return Ok(());
+            }
+        }
+
+        let mut f = File::open(path)
+            .await
+            .context(error::OpenFileSnafu { path })?;
         f.seek(SeekFrom::Start(offset))
             .await
             .context(error::SeekFileOffsetSnafu { path, offset })?;
@@ -486,7 +568,7 @@ impl SnapshotUploader {
                 offset,
             })?;
 
-        if let ZeroBlocks::Omit = context.zero_blocks {
+        if context.zero_blocks.omits_zero_content() {
             let sparse = block.iter().all(|&byte| byte == 0u8);
             // Found a block of all zeroes, and told to omit those from the snapshot.
             if sparse {
@@ -561,6 +643,7 @@ struct BlockContext {
     progress_bar: Arc<Option<ProgressBar>>,
     ebs_client: EbsClient,
     zero_blocks: ZeroBlocks,
+    data_map: Arc<DataMap>,
 }
 
 /// Potential errors while reading a local file and uploading a snapshot.
@@ -580,6 +663,15 @@ mod error {
             path: PathBuf,
             source: std::io::Error,
         },
+
+        #[snafu(display("Failed to scan '{}' for filesystem holes: {}", path.display(), source))]
+        BuildDataMap {
+            path: PathBuf,
+            source: std::io::Error,
+        },
+
+        #[snafu(display("Hole-detection task failed: {}", source))]
+        HoleMapTask { source: tokio::task::JoinError },
 
         #[snafu(display("{}", source))]
         GetBlockDeviceSize { source: crate::block_device::Error },
@@ -743,5 +835,52 @@ mod test {
     #[should_panic(expected = "need at least one EBS client")]
     fn with_client_shards_rejects_empty() {
         SnapshotUploader::with_client_shards(vec![]);
+    }
+
+    #[test]
+    fn zero_blocks_omission_matrix() {
+        // Include: never omits anything.
+        assert!(!ZeroBlocks::Include.omits_holes());
+        assert!(!ZeroBlocks::Include.omits_zero_content());
+
+        // Omit: skips holes (fast path) AND content-all-zero blocks.
+        assert!(ZeroBlocks::Omit.omits_holes());
+        assert!(ZeroBlocks::Omit.omits_zero_content());
+
+        // OmitHoles: skips only filesystem holes; keeps written-zero blocks.
+        assert!(ZeroBlocks::OmitHoles.omits_holes());
+        assert!(!ZeroBlocks::OmitHoles.omits_zero_content());
+    }
+
+    #[test]
+    fn hole_fast_path_block_selection() {
+        // Model the worker's pre-read decision at the EBS block granularity:
+        // a block is skipped without reading iff its byte range is entirely a
+        // hole. Data lives in block 0 and block 3 only.
+        let bs = 512 * 1024u64;
+        let mut tf = tempfile::tempfile().expect("tempfile");
+        let payload = vec![0x5Au8; bs as usize];
+        // block 0
+        std::io::Write::write_all(&mut tf, &payload).expect("write block 0");
+        // block 3 (leaving blocks 1 and 2 as a hole)
+        std::io::Seek::seek(&mut tf, std::io::SeekFrom::Start(3 * bs)).expect("seek block 3");
+        std::io::Write::write_all(&mut tf, &payload).expect("write block 3");
+        std::io::Write::flush(&mut tf).expect("flush");
+
+        let size = 4 * bs;
+        let map = match DataMap::from_file(&tf, size) {
+            Some(m) => m,
+            None => return, // filesystem lacks SEEK_HOLE; skip
+        };
+
+        // Blocks 0 and 3 always carry data.
+        assert!(map.range_has_data(0, bs), "block 0 has data");
+        assert!(map.range_has_data(3 * bs, bs), "block 3 has data");
+
+        // If the fs punched the hole, blocks 1 and 2 must read as holes.
+        if map.extent_count() > 1 {
+            assert!(!map.range_has_data(bs, bs), "block 1 is a hole");
+            assert!(!map.range_has_data(2 * bs, bs), "block 2 is a hole");
+        }
     }
 }
