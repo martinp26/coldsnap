@@ -164,6 +164,9 @@ impl SnapshotUploader {
     /// * `progress_bar` is optional, since output to the terminal may not be wanted.
     /// * `zero_blocks` specifies how zero blocks will be handled. If no value is provided
     ///   (`None`), then all blocks will be uploaded.
+    /// * `sidecar_path`, when set, supplies the hole map from a `qemu-img map` JSON side-car
+    ///   instead of scanning the source with `SEEK_HOLE`. Only consulted in a hole-omission
+    ///   mode; the side-car must cover exactly the source size.
     /// * `kms_key_id` is the KMS key ARN to use for encryption.
     /// * `parent_snapshot_id` is the ID of an existing snapshot to record as the parent for EBS
     ///   snapshot lineage. Cannot be combined with `kms_key_id`, since EBS rejects requests that
@@ -177,6 +180,7 @@ impl SnapshotUploader {
         tags: Option<Vec<Tag>>,
         progress_bar: Option<ProgressBar>,
         zero_blocks: Option<ZeroBlocks>,
+        sidecar_path: Option<PathBuf>,
         kms_key_id: Option<String>,
         parent_snapshot_id: Option<String>,
         workers: Option<usize>,
@@ -267,7 +271,17 @@ impl SnapshotUploader {
         // hole (workers then behave exactly as before).
         let data_map = if zero_blocks.omits_holes() {
             let size = file_size as u64;
-            if file_meta.file_type().is_block_device() {
+            if let Some(sidecar) = sidecar_path.as_ref() {
+                // A pre-generated qemu-img-map side-car supplies the same hole
+                // map a live SEEK walk would, so we skip scanning the source.
+                // The load validates the side-car covers exactly this image; a
+                // mismatch is a hard error, not a silent full upload.
+                let sidecar = PathBuf::from(sidecar);
+                tokio::task::spawn_blocking(move || DataMap::from_sidecar(&sidecar, size))
+                    .await
+                    .context(error::HoleMapTaskSnafu)?
+                    .context(error::SidecarSnafu)?
+            } else if file_meta.file_type().is_block_device() {
                 debug!(
                     "source is a block device; SEEK_HOLE hole detection is \
                      unavailable, uploading all allocated blocks (content-zero \
@@ -436,6 +450,15 @@ impl SnapshotUploader {
 
         self.complete_snapshot(&snapshot_id, changed_blocks_count, &full_hash)
             .await?;
+
+        // Emit the EBS linear aggregation checksum (SHA256 of the per-block
+        // SHA256 digests in block-index order). It covers only the blocks
+        // actually uploaded, so it matches across re-runs of the same omission
+        // mode but differs between modes that omit different block sets; it is
+        // not a whole-image content hash.
+        info!(
+            "Snapshot {snapshot_id} linear checksum over {changed_blocks_count} uploaded blocks (SHA256): {full_hash}"
+        );
 
         Ok(snapshot_id)
     }
@@ -691,6 +714,11 @@ mod error {
 
         #[snafu(display("Hole-detection task failed: {}", source))]
         HoleMapTask { source: tokio::task::JoinError },
+
+        #[snafu(display("{}", source))]
+        Sidecar {
+            source: crate::data_map::SidecarError,
+        },
 
         #[snafu(display("{}", source))]
         GetBlockDeviceSize { source: crate::block_device::Error },

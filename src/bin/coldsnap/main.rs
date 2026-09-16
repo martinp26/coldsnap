@@ -130,8 +130,11 @@ async fn run() -> Result<()> {
             );
 
             let progress_bar = build_progress_bar(upload_args.no_progress, "Uploading");
-            let zero_blocks =
-                resolve_zero_blocks(upload_args.omit_zero_blocks, upload_args.detect_holes)?;
+            let zero_blocks = resolve_zero_blocks(
+                upload_args.omit_zero_blocks,
+                upload_args.detect_holes,
+                upload_args.holes_from_sidecar.is_some(),
+            )?;
 
             debug!("Uploading {}", upload_args.file.display());
             let snapshot_id = uploader
@@ -142,6 +145,7 @@ async fn run() -> Result<()> {
                     Some(upload_args.tag),
                     progress_bar?,
                     zero_blocks,
+                    upload_args.holes_from_sidecar.clone(),
                     upload_args.kms_key_id,
                     upload_args.parent_snapshot_id,
                     upload_args.workers,
@@ -414,19 +418,27 @@ mod test {
     #[test]
     fn resolve_zero_blocks_modes() {
         // No flags: upload everything.
-        assert!(resolve_zero_blocks(false, false).unwrap().is_none());
+        assert!(resolve_zero_blocks(false, false, false).unwrap().is_none());
         // --omit-zero-blocks: content-scan omission.
         assert_eq!(
-            resolve_zero_blocks(true, false).unwrap(),
+            resolve_zero_blocks(true, false, false).unwrap(),
             Some(UploadZeroBlocks::Omit)
         );
         // --detect-holes: hole-only omission.
         assert_eq!(
-            resolve_zero_blocks(false, true).unwrap(),
+            resolve_zero_blocks(false, true, false).unwrap(),
             Some(UploadZeroBlocks::OmitHoles)
         );
-        // Both: rejected.
-        assert!(resolve_zero_blocks(true, true).is_err());
+        // --holes-from-sidecar: same hole-only mode, map sourced from a file.
+        assert_eq!(
+            resolve_zero_blocks(false, false, true).unwrap(),
+            Some(UploadZeroBlocks::OmitHoles)
+        );
+        // Any two (or all three) modes together: rejected.
+        assert!(resolve_zero_blocks(true, true, false).is_err());
+        assert!(resolve_zero_blocks(true, false, true).is_err());
+        assert!(resolve_zero_blocks(false, true, true).is_err());
+        assert!(resolve_zero_blocks(true, true, true).is_err());
     }
 }
 
@@ -479,6 +491,14 @@ struct UploadArgs {
     detect_holes: bool,
 
     #[argh(option)]
+    /// omit only the never-written holes described by a qemu-img-map JSON
+    /// side-car at PATH (the same hole map as --detect-holes, read from a file
+    /// instead of scanning); the side-car must cover exactly the image size;
+    /// safe for encrypted-launch snapshots; mutually exclusive with
+    /// --omit-zero-blocks and --detect-holes
+    holes_from_sidecar: Option<PathBuf>,
+
+    #[argh(option)]
     /// number of concurrent upload workers (default: 64)
     workers: Option<usize>,
 
@@ -487,20 +507,22 @@ struct UploadArgs {
     client_shards: Option<usize>,
 }
 
-/// Resolve the two mutually-exclusive sparse-upload flags into a `ZeroBlocks`
-/// mode. `--omit-zero-blocks` wins nothing over `--detect-holes`; supplying both
-/// is an error.
+/// Resolve the mutually-exclusive sparse-upload flags into a `ZeroBlocks` mode.
+/// At most one of `--omit-zero-blocks`, `--detect-holes`, or
+/// `--holes-from-sidecar` may be set. The two hole-based flags produce the same
+/// `OmitHoles` mode and differ only in where the hole map comes from (a live
+/// SEEK scan vs. a side-car file), which the caller wires up separately.
 fn resolve_zero_blocks(
     omit_zero_blocks: bool,
     detect_holes: bool,
+    holes_from_sidecar: bool,
 ) -> Result<Option<UploadZeroBlocks>> {
-    ensure!(
-        !(omit_zero_blocks && detect_holes),
-        error::OmitZeroAndDetectHolesSnafu
-    );
+    let modes_set =
+        u8::from(omit_zero_blocks) + u8::from(detect_holes) + u8::from(holes_from_sidecar);
+    ensure!(modes_set <= 1, error::ConflictingSparseModesSnafu);
     Ok(if omit_zero_blocks {
         Some(UploadZeroBlocks::Omit)
-    } else if detect_holes {
+    } else if detect_holes || holes_from_sidecar {
         Some(UploadZeroBlocks::OmitHoles)
     } else {
         None
@@ -579,7 +601,10 @@ mod error {
         #[snafu(display("--parent-snapshot-id and --kms-key-id cannot be used together (EBS StartSnapshot rejects Encrypted + ParentSnapshotId)"))]
         ParentAndKms,
 
-        #[snafu(display("--omit-zero-blocks and --detect-holes cannot be used together"))]
-        OmitZeroAndDetectHoles,
+        #[snafu(display(
+            "--omit-zero-blocks, --detect-holes, and --holes-from-sidecar are \
+             mutually exclusive; choose at most one"
+        ))]
+        ConflictingSparseModes,
     }
 }
