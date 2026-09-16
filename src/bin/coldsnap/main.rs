@@ -130,8 +130,11 @@ async fn run() -> Result<()> {
             );
 
             let progress_bar = build_progress_bar(upload_args.no_progress, "Uploading");
-            let zero_blocks =
-                resolve_zero_blocks(upload_args.omit_zero_blocks, upload_args.detect_holes)?;
+            let zero_blocks = resolve_zero_blocks(
+                upload_args.omit_zero_blocks,
+                upload_args.detect_holes,
+                upload_args.holes_from_sidecar,
+            )?;
 
             debug!("Uploading {}", upload_args.file.display());
             let snapshot_id = uploader
@@ -414,19 +417,30 @@ mod test {
     #[test]
     fn resolve_zero_blocks_modes() {
         // No flags: upload everything.
-        assert!(resolve_zero_blocks(false, false).unwrap().is_none());
+        let sidecar = || Some(PathBuf::from("image.map.json"));
+        assert!(resolve_zero_blocks(false, false, None).unwrap().is_none());
         // --omit-zero-blocks: content-scan omission.
         assert_eq!(
-            resolve_zero_blocks(true, false).unwrap(),
+            resolve_zero_blocks(true, false, None).unwrap(),
             Some(UploadZeroBlocks::Omit)
         );
         // --detect-holes: hole-only omission.
         assert_eq!(
-            resolve_zero_blocks(false, true).unwrap(),
+            resolve_zero_blocks(false, true, None).unwrap(),
             Some(UploadZeroBlocks::OmitHoles)
         );
-        // Both: rejected.
-        assert!(resolve_zero_blocks(true, true).is_err());
+        // --holes-from-sidecar: hole-only omission, map read from the side-car.
+        assert_eq!(
+            resolve_zero_blocks(false, false, sidecar()).unwrap(),
+            Some(UploadZeroBlocks::OmitHolesFromSidecar(PathBuf::from(
+                "image.map.json"
+            )))
+        );
+        // Any two (or all three) modes together: rejected.
+        assert!(resolve_zero_blocks(true, true, None).is_err());
+        assert!(resolve_zero_blocks(true, false, sidecar()).is_err());
+        assert!(resolve_zero_blocks(false, true, sidecar()).is_err());
+        assert!(resolve_zero_blocks(true, true, sidecar()).is_err());
     }
 }
 
@@ -479,6 +493,11 @@ struct UploadArgs {
     detect_holes: bool,
 
     #[argh(option)]
+    /// like --detect-holes, but read the hole map from a qemu-img-map JSON
+    /// side-car at PATH instead of scanning the image
+    holes_from_sidecar: Option<PathBuf>,
+
+    #[argh(option)]
     /// number of concurrent upload workers (default: 64)
     workers: Option<usize>,
 
@@ -487,23 +506,22 @@ struct UploadArgs {
     client_shards: Option<usize>,
 }
 
-/// Resolve the two mutually-exclusive sparse-upload flags into a `ZeroBlocks`
-/// mode. `--omit-zero-blocks` wins nothing over `--detect-holes`; supplying both
-/// is an error.
+/// Resolve the mutually-exclusive sparse-upload flags into a `ZeroBlocks` mode.
 fn resolve_zero_blocks(
     omit_zero_blocks: bool,
     detect_holes: bool,
+    holes_from_sidecar: Option<PathBuf>,
 ) -> Result<Option<UploadZeroBlocks>> {
-    ensure!(
-        !(omit_zero_blocks && detect_holes),
-        error::OmitZeroAndDetectHolesSnafu
-    );
+    let modes_set = u8::from(omit_zero_blocks)
+        + u8::from(detect_holes)
+        + u8::from(holes_from_sidecar.is_some());
+    ensure!(modes_set <= 1, error::ConflictingSparseModesSnafu);
     Ok(if omit_zero_blocks {
         Some(UploadZeroBlocks::Omit)
     } else if detect_holes {
         Some(UploadZeroBlocks::OmitHoles)
     } else {
-        None
+        holes_from_sidecar.map(UploadZeroBlocks::OmitHolesFromSidecar)
     })
 }
 
@@ -579,7 +597,10 @@ mod error {
         #[snafu(display("--parent-snapshot-id and --kms-key-id cannot be used together (EBS StartSnapshot rejects Encrypted + ParentSnapshotId)"))]
         ParentAndKms,
 
-        #[snafu(display("--omit-zero-blocks and --detect-holes cannot be used together"))]
-        OmitZeroAndDetectHoles,
+        #[snafu(display(
+            "--omit-zero-blocks, --detect-holes, and --holes-from-sidecar are \
+             mutually exclusive; choose at most one"
+        ))]
+        ConflictingSparseModes,
     }
 }

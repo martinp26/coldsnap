@@ -93,7 +93,7 @@ impl UploadStats {
 }
 
 /// Specify how blocks of all zeroes should be handled.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ZeroBlocks {
     /// Include blocks of all zeroes in the snapshot.
     Include,
@@ -104,16 +104,22 @@ pub enum ZeroBlocks {
     /// Omit only never-written filesystem holes, detected via `SEEK_DATA`/`SEEK_HOLE`.
     /// Blocks written with zeroes are still uploaded, so this is safe for encrypted snapshots.
     OmitHoles,
+    /// Like `OmitHoles`, but read the hole map from a `qemu-img map` JSON side-car instead of
+    /// scanning the source. The side-car must cover exactly the source size.
+    OmitHolesFromSidecar(PathBuf),
 }
 
 impl ZeroBlocks {
     /// Whether blocks lying entirely in a hole are skipped without reading them.
-    fn omits_holes(self) -> bool {
-        matches!(self, ZeroBlocks::Omit | ZeroBlocks::OmitHoles)
+    fn omits_holes(&self) -> bool {
+        matches!(
+            self,
+            ZeroBlocks::Omit | ZeroBlocks::OmitHoles | ZeroBlocks::OmitHolesFromSidecar(_)
+        )
     }
 
     /// Whether blocks that read back as all zeroes are skipped.
-    fn omits_zero_content(self) -> bool {
+    fn omits_zero_content(&self) -> bool {
         matches!(self, ZeroBlocks::Omit)
     }
 }
@@ -256,7 +262,13 @@ impl SnapshotUploader {
             target: "u64",
         })?;
         let data_map = if zero_blocks.omits_holes() {
-            if file_meta.file_type().is_block_device() {
+            if let ZeroBlocks::OmitHolesFromSidecar(sidecar) = &zero_blocks {
+                let sidecar = PathBuf::from(sidecar);
+                tokio::task::spawn_blocking(move || DataMap::from_sidecar(&sidecar, size))
+                    .await
+                    .context(error::HoleMapTaskSnafu)?
+                    .context(error::SidecarSnafu)?
+            } else if file_meta.file_type().is_block_device() {
                 debug!(
                     "source is a block device; SEEK_HOLE hole detection is \
                      unavailable, uploading all allocated blocks (content-zero \
@@ -290,6 +302,7 @@ impl SnapshotUploader {
             DataMap::full(size)
         };
         let data_map = Arc::new(data_map);
+        let zero_blocks = Arc::new(zero_blocks);
 
         // Create a context for each block that can be moved to another thread.
         let mut block_contexts = Vec::new();
@@ -317,7 +330,7 @@ impl SnapshotUploader {
                 block_errors: Arc::clone(&block_errors),
                 progress_bar: Arc::clone(&progress_bar),
                 ebs_client: self.client_for_block(i).clone(),
-                zero_blocks,
+                zero_blocks: Arc::clone(&zero_blocks),
                 data_map: Arc::clone(&data_map),
             });
 
@@ -422,6 +435,11 @@ impl SnapshotUploader {
 
         self.complete_snapshot(&snapshot_id, changed_blocks_count, &full_hash)
             .await?;
+
+        // Covers only the uploaded blocks, so it differs between omission modes.
+        info!(
+            "Snapshot {snapshot_id} linear checksum over {changed_blocks_count} uploaded blocks (SHA256): {full_hash}"
+        );
 
         Ok(snapshot_id)
     }
@@ -642,7 +660,7 @@ struct BlockContext {
     block_errors: Arc<Mutex<BTreeMap<i32, Error>>>,
     progress_bar: Arc<Option<ProgressBar>>,
     ebs_client: EbsClient,
-    zero_blocks: ZeroBlocks,
+    zero_blocks: Arc<ZeroBlocks>,
     data_map: Arc<DataMap>,
 }
 
@@ -672,6 +690,11 @@ mod error {
 
         #[snafu(display("Hole-detection task failed: {}", source))]
         HoleMapTask { source: tokio::task::JoinError },
+
+        #[snafu(display("{}", source))]
+        Sidecar {
+            source: crate::data_map::SidecarError,
+        },
 
         #[snafu(display("{}", source))]
         GetBlockDeviceSize { source: crate::block_device::Error },
@@ -850,6 +873,10 @@ mod test {
         // OmitHoles: skips only filesystem holes; keeps written-zero blocks.
         assert!(ZeroBlocks::OmitHoles.omits_holes());
         assert!(!ZeroBlocks::OmitHoles.omits_zero_content());
+
+        let sidecar = ZeroBlocks::OmitHolesFromSidecar(PathBuf::from("image.map.json"));
+        assert!(sidecar.omits_holes());
+        assert!(!sidecar.omits_zero_content());
     }
 
     #[test]

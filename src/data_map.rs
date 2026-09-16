@@ -13,9 +13,11 @@ use log::debug;
 use nix::errno::Errno;
 use nix::fcntl::{posix_fadvise, PosixFadviseAdvice};
 use nix::unistd::{lseek, Whence};
+use serde::Deserialize;
+use snafu::{ensure, OptionExt, ResultExt, Snafu};
 use std::convert::TryFrom;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A sorted, non-overlapping set of `[start, end)` byte ranges that contain
 /// data. Any offset not covered by an extent is a hole (reads back as zeroes).
@@ -34,6 +36,46 @@ impl DataMap {
                 vec![(0, size)]
             },
         }
+    }
+
+    /// Build a data map from a `qemu-img map --output=json` side-car. Extents
+    /// with `data: true` are data; the rest are holes. The extents must be
+    /// contiguous and cover exactly `expected_size` bytes.
+    pub(crate) fn from_sidecar(path: &Path, expected_size: u64) -> Result<Self, SidecarError> {
+        let bytes = std::fs::read(path).context(ReadSnafu { path })?;
+        let raw: Vec<SidecarExtent> =
+            serde_json::from_slice(&bytes).context(ParseSnafu { path })?;
+
+        let mut covered: u64 = 0;
+        let mut extents: Vec<(u64, u64)> = Vec::new();
+        for e in &raw {
+            let end = e.start.checked_add(e.length).context(OverflowSnafu {
+                path,
+                start: e.start,
+                length: e.length,
+            })?;
+            ensure!(
+                e.start == covered,
+                NonContiguousSnafu {
+                    path,
+                    expected: covered,
+                    got: e.start,
+                }
+            );
+            covered = end;
+            if e.data {
+                extents.push((e.start, end));
+            }
+        }
+        ensure!(
+            covered == expected_size,
+            SizeMismatchSnafu {
+                path,
+                covered,
+                expected: expected_size,
+            }
+        );
+        Ok(DataMap { extents })
     }
 
     /// Build a data map by walking `path` with `SEEK_DATA`/`SEEK_HOLE`.
@@ -126,10 +168,181 @@ impl DataMap {
     }
 }
 
+/// One extent of a `qemu-img map --output=json` side-car; other fields are ignored.
+#[derive(Debug, Deserialize)]
+struct SidecarExtent {
+    start: u64,
+    length: u64,
+    #[serde(default)]
+    data: bool,
+}
+
+/// Errors from loading a hole map out of a side-car file.
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
+pub(crate) enum SidecarError {
+    #[snafu(display("failed to read side-car '{}': {}", path.display(), source))]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("failed to parse side-car '{}' as qemu-img-map JSON: {}", path.display(), source))]
+    Parse {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+
+    #[snafu(display(
+        "side-car '{}' has an extent at {start} of length {length} that overflows",
+        path.display()
+    ))]
+    Overflow {
+        path: PathBuf,
+        start: u64,
+        length: u64,
+    },
+
+    #[snafu(display(
+        "side-car '{}' is not contiguous: expected an extent at {expected}, got {got}",
+        path.display()
+    ))]
+    NonContiguous {
+        path: PathBuf,
+        expected: u64,
+        got: u64,
+    },
+
+    #[snafu(display(
+        "side-car '{}' covers {covered} bytes but the image is {expected} bytes; \
+         refusing to upload with a mismatched map",
+        path.display()
+    ))]
+    SizeMismatch {
+        path: PathBuf,
+        covered: u64,
+        expected: u64,
+    },
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
     use std::io::{Seek, SeekFrom, Write};
+
+    fn write_sidecar(json: &str) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+        f.write_all(json.as_bytes()).expect("write");
+        f.flush().expect("flush");
+        f
+    }
+
+    const SIDECAR: &str = r##"[{ "start": 0, "length": 512, "depth": 0, "present": true, "zero": false, "data": true, "compressed": false, "offset": 0},
+{ "start": 512, "length": 512, "depth": 0, "present": true, "zero": true, "data": false, "compressed": false, "offset": 512}]
+"##;
+
+    #[test]
+    fn sidecar_selects_data_extents() {
+        let sc = write_sidecar(SIDECAR);
+        let map = DataMap::from_sidecar(sc.path(), 1024).expect("load");
+        assert_eq!(map.extent_count(), 1);
+        assert_eq!(map.data_bytes(), 512);
+        assert!(map.range_has_data(0, 512)); // data run
+        assert!(!map.range_has_data(512, 512)); // hole
+    }
+
+    #[test]
+    fn sidecar_written_zeroes_are_data() {
+        // A fully-written all-zero image is a single data extent
+        // (data:true, zero:false), so nothing is omitted.
+        let sc = write_sidecar(
+            r##"[{ "start": 0, "length": 1024, "depth": 0, "present": true, "zero": false, "data": true, "compressed": false, "offset": 0}]"##,
+        );
+        let map = DataMap::from_sidecar(sc.path(), 1024).expect("load");
+        assert!(map.range_has_data(0, 1024));
+        assert_eq!(map.data_bytes(), 1024);
+    }
+
+    #[test]
+    fn sidecar_fully_sparse_is_all_holes() {
+        let sc = write_sidecar(
+            r##"[{ "start": 0, "length": 4096, "depth": 0, "present": true, "zero": true, "data": false, "compressed": false, "offset": 0}]"##,
+        );
+        let map = DataMap::from_sidecar(sc.path(), 4096).expect("load");
+        assert_eq!(map.extent_count(), 0);
+        assert!(!map.range_has_data(0, 4096));
+    }
+
+    #[test]
+    fn sidecar_size_mismatch_is_error() {
+        let sc = write_sidecar(SIDECAR); // covers 1024
+        assert!(matches!(
+            DataMap::from_sidecar(sc.path(), 999).unwrap_err(),
+            SidecarError::SizeMismatch {
+                covered: 1024,
+                expected: 999,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn sidecar_gap_is_error() {
+        let sc = write_sidecar(
+            r##"[{ "start": 0, "length": 512, "data": true },
+                 { "start": 1024, "length": 512, "data": false }]"##,
+        );
+        assert!(matches!(
+            DataMap::from_sidecar(sc.path(), 1536).unwrap_err(),
+            SidecarError::NonContiguous {
+                expected: 512,
+                got: 1024,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn sidecar_overlap_is_error() {
+        let sc = write_sidecar(
+            r##"[{ "start": 0, "length": 1024, "data": true },
+                 { "start": 512, "length": 512, "data": false }]"##,
+        );
+        assert!(matches!(
+            DataMap::from_sidecar(sc.path(), 1024).unwrap_err(),
+            SidecarError::NonContiguous {
+                expected: 1024,
+                got: 512,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn sidecar_overflow_is_error() {
+        let sc = write_sidecar(
+            r##"[{ "start": 0, "length": 512, "data": true },
+                 { "start": 512, "length": 18446744073709551615, "data": false }]"##,
+        );
+        assert!(matches!(
+            DataMap::from_sidecar(sc.path(), 1024).unwrap_err(),
+            SidecarError::Overflow { start: 512, .. }
+        ));
+    }
+
+    #[test]
+    fn sidecar_empty_map_covers_zero() {
+        let sc = write_sidecar("[]\n");
+        assert!(DataMap::from_sidecar(sc.path(), 0).is_ok());
+        assert!(matches!(
+            DataMap::from_sidecar(sc.path(), 4096).unwrap_err(),
+            SidecarError::SizeMismatch {
+                covered: 0,
+                expected: 4096,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn full_map_covers_everything() {
