@@ -167,6 +167,52 @@ async fn run() -> Result<()> {
             }
         }
 
+        SubCommand::Map(map_args) => {
+            ensure!(
+                map_args.file.file_name().is_some(),
+                error::ValidateFilenameSnafu {
+                    path: map_args.file.clone()
+                }
+            );
+            ensure!(
+                map_args.file.exists(),
+                error::FileDoesNotExistSnafu {
+                    path: map_args.file.clone()
+                }
+            );
+            // `None` means stdout.
+            let dest = match map_args.output {
+                Some(dest) if dest.as_os_str() == "-" => None,
+                Some(dest) => Some(dest),
+                None => Some(default_sidecar_path(&map_args.file)),
+            };
+            if let Some(dest) = &dest {
+                ensure!(
+                    map_args.force || !dest.exists(),
+                    error::FileExistsSnafu { path: dest.clone() }
+                );
+            }
+            debug!(
+                "Generating hole map side-car for {}",
+                map_args.file.display()
+            );
+            // SEEK_DATA/SEEK_HOLE is only available on std's sync File.
+            let file = map_args.file.clone();
+            let text = tokio::task::spawn_blocking(move || coldsnap::generate_sidecar(&file))
+                .await
+                .context(error::GenerateSidecarTaskSnafu)?
+                .context(error::GenerateSidecarSnafu)?;
+            match dest {
+                None => print!("{text}"),
+                Some(dest) => {
+                    tokio::fs::write(&dest, &text)
+                        .await
+                        .context(error::WriteSidecarSnafu { file: dest.clone() })?;
+                    eprintln!("wrote side-car to {}", dest.display());
+                }
+            }
+        }
+
         SubCommand::Wait(wait_args) => {
             let client = Ec2Client::new(&client_config);
             let waiter = SnapshotWaiter::new(client);
@@ -319,6 +365,7 @@ struct Args {
 enum SubCommand {
     Download(DownloadArgs),
     Upload(UploadArgs),
+    Map(MapArgs),
     Wait(WaitArgs),
 }
 
@@ -534,6 +581,31 @@ fn seconds_from_str(input: &str) -> std::result::Result<Duration, String> {
 }
 
 #[derive(FromArgs, PartialEq, Debug)]
+#[argh(subcommand, name = "map")]
+/// Generate a qemu-img-map-compatible JSON hole-map side-car for a raw image,
+/// for use with `upload --holes-from-sidecar`.
+struct MapArgs {
+    #[argh(positional)]
+    /// path to the raw (uncompressed) image file
+    file: PathBuf,
+
+    #[argh(option, short = 'o')]
+    /// side-car path (default: <image>.map.json; use "-" for stdout)
+    output: Option<PathBuf>,
+
+    #[argh(switch)]
+    /// overwrite an existing side-car
+    force: bool,
+}
+
+/// The default side-car path for an image: `<image>.map.json`.
+fn default_sidecar_path(image: &std::path::Path) -> PathBuf {
+    let mut name = image.as_os_str().to_os_string();
+    name.push(".map.json");
+    PathBuf::from(name)
+}
+
+#[derive(FromArgs, PartialEq, Debug)]
 #[argh(subcommand, name = "wait")]
 /// Wait for an EBS snapshot to be in a desired state.
 struct WaitArgs {
@@ -602,5 +674,17 @@ mod error {
              mutually exclusive; choose at most one"
         ))]
         ConflictingSparseModes,
+
+        #[snafu(display("Failed to generate hole-map side-car: {}", source))]
+        GenerateSidecar { source: coldsnap::MapError },
+
+        #[snafu(display("Side-car generation task failed: {}", source))]
+        GenerateSidecarTask { source: tokio::task::JoinError },
+
+        #[snafu(display("Failed to write side-car '{}': {}", file.display(), source))]
+        WriteSidecar {
+            file: std::path::PathBuf,
+            source: std::io::Error,
+        },
     }
 }
