@@ -59,6 +59,7 @@ waiter.wait_for_completed("snap-1234")
 mod block_device;
 mod data_map;
 mod download;
+mod map;
 mod upload;
 mod wait;
 
@@ -69,6 +70,9 @@ pub use download::SnapshotDownloader;
 pub use upload::Error as UploadError;
 pub use upload::SnapshotUploader;
 pub use upload::ZeroBlocks as UploadZeroBlocks;
+
+pub use map::generate_sidecar;
+pub use map::Error as MapError;
 
 pub use wait::Error as WaitError;
 pub use wait::{SnapshotWaiter, WaitParams};

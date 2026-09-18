@@ -203,6 +203,12 @@ impl DataMap {
         self.extents.len()
     }
 
+    /// The sorted, non-overlapping `[start, end)` data extents backing this map.
+    /// Used to serialize a `qemu-img map` side-car.
+    pub(crate) fn extents(&self) -> &[(u64, u64)] {
+        &self.extents
+    }
+
     /// Total number of bytes that contain data across all extents.
     #[cfg(test)]
     pub(crate) fn data_bytes(&self) -> u64 {
